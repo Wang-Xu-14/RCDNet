@@ -141,9 +141,12 @@ class Mainnet(nn.Module):
 
 # proxNet_M
 class Mnet(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels,color=True, burst_length=1, blind_est=True, kernel_size2=[5], sep_conv=False,
+                core_bias=False):
         super(Mnet, self).__init__()
         self.channels = channels
+        self.burst_length = burst_length
+        self.core_bias = core_bias
         self.tau0 = torch.Tensor([0.5])
         self.taum= self.tau0.unsqueeze(dim=0).unsqueeze(dim=0).unsqueeze(dim=0).expand(-1, self.channels,-1,-1)
         self.tau = nn.Parameter(self.taum, requires_grad=True)                      # for sparse rain map
@@ -171,19 +174,42 @@ class Mnet(nn.Module):
                                   nn.ReLU(),
                                   nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
                                   nn.BatchNorm2d(self.channels),
-                                   )
-    def forward(self, input):
+                                  )
+        self.outc = nn.Conv2d(self.channels,self.channels, kernel_size=1, stride = 1,padding = 0)
+        self.kernel_pred = KernelConv(kernel_size2, sep_conv, self.core_bias)
+        self.conv_final = nn.Conv2d(self.channels*4,self.channels, kernel_size=3, stride=1, padding=1)
+
+
+
+
+    def forward(self, input,white_level=1.0):
         m1  = F.relu(input + self.resm1(input))
         m2  = F.relu(m1+ self.resm2(m1))
         m3  = F.relu(m2+ self.resm3(m2))
         m4  = F.relu(m3+ self.resm4(m3))
-        m_rev =self.f(m4-self.tau)                                     # for sparse rain map
+        m5 =self.f(m4-self.tau)                                     # for sparse rain map
+        
+        core = self.outc(m5)
+        
+        pred1 = self.kernel_pred(input, core, white_level, rate=1)
+        pred2 = self.kernel_pred(input, core, white_level, rate=2)
+        pred3 = self.kernel_pred(input, core, white_level, rate=3)
+        pred4 = self.kernel_pred(input, core, white_level, rate=4)
+
+        pred_cat = torch.cat([torch.cat([torch.cat([pred1, pred2], dim=1), pred3], dim=1), pred4], dim=1)
+        m_rev = self.conv_final(pred_cat)
+        
+        #pred = self.kernel_pred(data, core, white_level, rate=1)
+        
         return m_rev
 
 # proxNet_B
 class Xnet(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels,color=True, burst_length=1, blind_est=True, kernel_size2=[5], sep_conv=False,
+                core_bias=False ):
         super(Xnet, self).__init__()
+        self.burst_length = burst_length
+        self.core_bias = core_bias
         self.channels = channels
         self.resx1 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
                                   nn.BatchNorm2d(self.channels),
@@ -198,7 +224,7 @@ class Xnet(nn.Module):
                                   nn.BatchNorm2d(self.channels),
                                   )
         self.resx3 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
-                                 nn.BatchNorm2d(self.channels),
+                                  nn.BatchNorm2d(self.channels),
                                   nn.ReLU(),
                                   nn.Conv2d(self.channels, self.channels,  kernel_size=3, stride = 1, padding= 1, dilation = 1),
                                   nn.BatchNorm2d(self.channels),
@@ -207,11 +233,134 @@ class Xnet(nn.Module):
                                   nn.BatchNorm2d(self.channels),
                                   nn.ReLU(),
                                   nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
-                                  nn.BatchNorm2d(self.channels),
-                                  )
-    def forward(self, input):
+                                  nn.BatchNorm2d(self.channels),)
+        self.outc = nn.Conv2d(self.channels,self.channels, kernel_size=1, stride = 1,padding = 0)
+        self.kernel_pred = KernelConv(kernel_size2, sep_conv, self.core_bias)
+        self.conv_final = nn.Conv2d(self.channels*4,self.channels, kernel_size=3, stride=1, padding=1)   
+
+                               
+    def forward(self, input,white_level=1.0):
         x1  = F.relu(input + self.resx1(input))
         x2  = F.relu(x1 + self.resx2(x1))
         x3  = F.relu(x2 + self.resx3(x2))
         x4  = F.relu(x3 + self.resx4(x3))
-        return x4
+        core = self.outc(x4)
+        
+        pred1 = self.kernel_pred(input, core, white_level, rate=1)
+        pred2 = self.kernel_pred(input, core, white_level, rate=2)
+        pred3 = self.kernel_pred(input, core, white_level, rate=3)
+        pred4 = self.kernel_pred(input, core, white_level, rate=4)
+
+        pred_cat = torch.cat([torch.cat([torch.cat([pred1, pred2], dim=1), pred3], dim=1), pred4], dim=1)
+        pred = self.conv_final(pred_cat)
+        
+        #pred = self.kernel_pred(data, core, white_level, rate=1)
+        
+        return pred
+
+
+
+
+
+
+
+
+class KernelConv(nn.Module):
+    """
+    the class of computing prediction
+    """
+    def __init__(self, kernel_size2=[5], sep_conv=False, core_bias=False):
+        super(KernelConv, self).__init__()
+        self.kernel_size2 = sorted(kernel_size2)
+        self.sep_conv = sep_conv
+        self.core_bias = core_bias
+
+    def _sep_conv_core(self, core, batch_size, N, color, height, width):
+        """
+        convert the sep_conv core to conv2d core
+        2p --> p^2
+        :param core: shape: batch*(N*2*K)*height*width
+        :return:
+        """
+        kernel_total = sum(self.kernel_size2)
+        core = core.view(batch_size, N, -1, color, height, width)
+        if not self.core_bias:
+            core_1, core_2 = torch.split(core, kernel_total, dim=2)
+        else:
+            core_1, core_2, core_3 = torch.split(core, kernel_total, dim=2)
+        # output core
+        core_out = {}
+        cur = 0
+        for K in self.kernel_size2:
+            t1 = core_1[:, :, cur:cur + K, ...].view(batch_size, N, K, 1, 3, height, width)
+            t2 = core_2[:, :, cur:cur + K, ...].view(batch_size, N, 1, K, 3, height, width)
+            core_out[K] = torch.einsum('ijklno,ijlmno->ijkmno', [t1, t2]).view(batch_size, N, K * K, color, height, width)
+            cur += K
+        # it is a dict
+        return core_out, None if not self.core_bias else core_3.squeeze()
+
+    def _convert_dict(self, core, batch_size, N, color, height, width):
+        """
+        make sure the core to be a dict, generally, only one kind of kernel size is suitable for the func.
+        :param core: shape: batch_size*(N*K*K)*height*width
+        :return: core_out, a dict
+        """
+        core_out = {}
+        core = core.view(batch_size, N, -1, color, height, width)
+        core_out[self.kernel_size2[0]] = core[:, :, 0:self.kernel_size2[0]**2, ...]
+        bias = None if not self.core_bias else core[:, :, -1, ...]
+        return core_out, bias
+
+    def forward(self, frames, core, white_level=1.0, rate=1):
+        """
+        compute the pred image according to core and frames
+        :param frames: [batch_size, N, 3, height, width]
+        :param core: [batch_size, N, dict(kernel), 3, height, width]
+        :return:
+        """
+        if len(frames.size()) == 5:
+            batch_size, N, color, height, width = frames.size()
+        else:
+            batch_size, N, height, width = frames.size()
+            color = 1
+            frames = frames.view(batch_size, N, color, height, width)
+        if self.sep_conv:
+            core, bias = self._sep_conv_core(core, batch_size, N, color, height, width)
+        else:
+            core, bias = self._convert_dict(core, batch_size, N, color, height, width)
+        img_stack = []
+        pred_img = []
+        kernel = self.kernel_size2[::-1]
+        for index, K in enumerate(kernel):
+            if not img_stack:
+                padding_num = (K//2) * rate
+                frame_pad = F.pad(frames, [padding_num, padding_num, padding_num, padding_num])
+                for i in range(0, K):
+                    for j in range(0, K):
+                        img_stack.append(frame_pad[..., i*rate:i*rate + height, j*rate:j*rate + width])
+                img_stack = torch.stack(img_stack, dim=2)
+            else:
+                k_diff = (kernel[index - 1] - kernel[index]) // 2
+                img_stack = img_stack[:, :, k_diff:-k_diff, ...]
+            # print('img_stack:', img_stack.size())
+            pred_img.append(torch.sum(
+                core[K].mul(img_stack), dim=2, keepdim=False
+            ))
+        pred_img = torch.stack(pred_img, dim=0)
+        # print('pred_stack:', pred_img.size())
+        pred_img_i = torch.mean(pred_img, dim=0, keepdim=False)
+        #print("pred_img_i", pred_img_i.size())
+        # N = 1
+        pred_img_i = pred_img_i.squeeze(2)
+        #print("pred_img_i", pred_img_i.size())
+        # if bias is permitted
+        if self.core_bias:
+            if bias is None:
+                raise ValueError('The bias should not be None.')
+            pred_img_i += bias
+        # print('white_level', white_level.size())
+        pred_img_i = pred_img_i / white_level
+        #pred_img = torch.mean(pred_img_i, dim=1, keepdim=True)
+        # print('pred_img:', pred_img.size())
+        # print('pred_img_i:', pred_img_i.size())
+        return pred_img_i
