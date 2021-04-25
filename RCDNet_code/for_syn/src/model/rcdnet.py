@@ -23,13 +23,13 @@ kernel = torch.FloatTensor(kernel)
 
 # filtering on rainy image for initializing B^(0) and Z^(0), refer to supplementary material(SM)
 w_x = (torch.FloatTensor([[1.0,1.0,1.0],[1.0,1.0,1.0],[1.0,1.0,1.0]])/9)
-w_x_conv = w_x.unsqueeze(dim=0).unsqueeze(dim=0)
+w_x_conv = w_x.unsqueeze(dim=0).unsqueeze(dim=0)  #增加维度
 
 class Mainnet(nn.Module):
     def __init__(self, args):
         super(Mainnet,self).__init__()
-        self.S = args.stage                                      #Stage number S includes the initialization process
-        self.iter = self.S-1                                     #not include the initialization process
+        self.S = args.stage                   #阶段号S  #Stage number S includes the initialization process
+        self.iter = self.S-1                       #not include the initialization process
         self.num_M = args.num_M
         self.num_Z = args.num_Z
 
@@ -52,16 +52,25 @@ class Mainnet(nn.Module):
         # proxNet in initialization process
         self.xnet = Xnet(self.num_Z+3)                                  # 3 means R,G,B channels for color image
         self.mnet = Mnet(self.num_M)
+        self.xnet1 = Xnet(self.num_Z+3)
+        self.mnet1 = Mnet(self.num_M)
         # proxNet in iterative process
         self.x_stage = self.make_xnet(self.S, self.num_Z + 3)
         self.m_stage = self.make_mnet(self.S, self.num_M)
         # fine-tune at the last
-        self.fxnet = Xnet(self.num_Z + 3)
+        self.fmnet = Mnet1(self.num_M)
+        self.fxnet = Xnet1(self.num_Z + 3)
 
         # for sparse rain layer
         self.f = nn.ReLU(inplace=True)
         self.taumm = torch.Tensor([1])
         self.tau = nn.Parameter(self.taumm, requires_grad=True)
+      
+
+
+
+
+
     def make_xnet(self, iters, channel):
         layers = []
         for i in range(iters):
@@ -93,6 +102,7 @@ class Mainnet(nn.Module):
          input_ini = torch.cat((input, z0), dim=1)
          out_dual = self.xnet(input_ini)
          B0 = out_dual[:,:3,:,:]
+
          Z = out_dual[:,3:,:,:]
 
          # 1st iteration: Updating B0-->M1
@@ -100,6 +110,7 @@ class Mainnet(nn.Module):
          ECM = self.f(ES-self.tau)                                            #for sparse rain layer
          GM = F.conv_transpose2d(ECM, self.weight0/10, stride=1, padding=4)   # /10 for controlling the updating speed
          M = self.m_stage[0](GM)
+
          CM = F.conv2d(M, self.conv[1,:,:,:,:]/10, stride =1, padding = 4)    # self.conv[1,:,:,:,:]：rain kernel is inter-stage sharing
        
          # 1st iteration: Updating M1-->B1
@@ -110,18 +121,18 @@ class Mainnet(nn.Module):
          input_dual = torch.cat((x_dual, Z), dim=1)
          out_dual = self.x_stage[0](input_dual)
          B = out_dual[:,:3,:,:]
+
          Z = out_dual[:,3:,:,:]
          ListB.append(B)
          ListCM.append(CM)
 
-         for i in range(self.iter):
+         for i in range(self.iter-1):
              # M-net
              ES = input - B
              ECM = CM- ES
              GM = F.conv_transpose2d(ECM,  self.conv[1,:,:,:,:]/10, stride =1, padding = 4)
              input_new = M - self.eta11[i,:]/10*GM
              M = self.m_stage[i+1](input_new)
-
              # B-net
              CM = F.conv2d(M,  self.conv[1,:,:,:,:]/10, stride =1, padding = 4)
              ListCM.append(CM)
@@ -134,6 +145,25 @@ class Mainnet(nn.Module):
              B = out_dual[:,:3,:,:]
              Z = out_dual[:,3:,:,:]
              ListB.append(B)
+
+         ES = input - B
+         ECM = CM- ES
+         GM = F.conv_transpose2d(ECM,  self.conv[1,:,:,:,:]/10, stride =1, padding = 4)
+         input_new = M - self.eta11[i,:]/10*GM
+         M = self.fmnet(input_new)
+             # B-net
+         CM = F.conv2d(M,  self.conv[1,:,:,:,:]/10, stride =1, padding = 4)
+         ListCM.append(CM)
+         EB = input - CM
+         EX = B - EB
+         GX = EX
+         x_dual = B - self.eta12[i,:]/10*GX
+         input_dual = torch.cat((x_dual,Z), dim=1) 
+         out_dual  = self.x_stage[self.iter](input_dual)
+         B = out_dual[:,:3,:,:]
+         Z = out_dual[:,3:,:,:]
+         ListB.append(B)
+
          out_dual = self.fxnet(out_dual)                # fine-tune
          B = out_dual[:,:3,:,:]
          ListB.append(B)
@@ -141,12 +171,9 @@ class Mainnet(nn.Module):
 
 # proxNet_M
 class Mnet(nn.Module):
-    def __init__(self, channels,color=True, burst_length=1, blind_est=True, kernel_size2=[5], sep_conv=False,
-                core_bias=False):
+    def __init__(self, channels):
         super(Mnet, self).__init__()
         self.channels = channels
-        self.burst_length = burst_length
-        self.core_bias = core_bias
         self.tau0 = torch.Tensor([0.5])
         self.taum= self.tau0.unsqueeze(dim=0).unsqueeze(dim=0).unsqueeze(dim=0).expand(-1, self.channels,-1,-1)
         self.tau = nn.Parameter(self.taum, requires_grad=True)                      # for sparse rain map
@@ -174,14 +201,109 @@ class Mnet(nn.Module):
                                   nn.ReLU(),
                                   nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
                                   nn.BatchNorm2d(self.channels),
+                                   )
+    def forward(self, input):
+        m1  = F.relu(input + self.resm1(input))
+        m2  = F.relu(m1+ self.resm2(m1))
+        m3  = F.relu(m2+ self.resm3(m2))
+        m4  = F.relu(m3+ self.resm4(m3))
+        m_rev =self.f(m4-self.tau)                                     # for sparse rain map
+        return m_rev
+
+
+
+class Xnet(nn.Module):
+    def __init__(self, channels):
+        super(Xnet, self).__init__()
+        self.channels = channels
+        self.resx1 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
                                   )
-        self.outc = nn.Conv2d(self.channels,self.channels, kernel_size=1, stride = 1,padding = 0)
+        self.resx2 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  )
+        self.resx3 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                 nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels,  kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  )
+        self.resx4 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  )
+    def forward(self, input):
+        x1  = F.relu(input + self.resx1(input))
+        x2  = F.relu(x1 + self.resx2(x1))
+        x3  = F.relu(x2 + self.resx3(x2))
+        x4  = F.relu(x3 + self.resx4(x3))
+        return x4
+
+
+# proxNet_M
+class Mnet1(nn.Module):
+    def __init__(self, channels,color=True, burst_length=1, blind_est=True, kernel_size2=[3], sep_conv=False,core_bias=False):
+        super(Mnet1, self).__init__()
+
+
+
+        self.burst_length = burst_length
+        self.core_bias = core_bias
+
+        self.channels = channels
+        self.tau0 = torch.Tensor([0.5])
+        self.taum= self.tau0.unsqueeze(dim=0).unsqueeze(dim=0).unsqueeze(dim=0).expand(-1, self.channels,-1,-1)
+        self.tau = nn.Parameter(self.taum, requires_grad=True) 
+        # 首先可以把这个函数理解为类型转换函数，将一个不可训练的类型Tensor转换成可以训练的类型parameter并将这个parameter绑定到这个module里面(net.parameter()中就有这个绑定的parameter
+        #   所以在参数优化的时候可以进行优化的)，所以经过类型转换这个self.v变成了模型的一部分，
+        # 成为了模型中根据训练可以改动的参数了。使用这个函数的目的也是想让某些变量在学习的过程中不断的修改其值以达到最优化。
+
+
+
+                             # for sparse rain map
+        self.f = nn.ReLU(inplace=True)
+        self.resm1 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation =1),
+                                  nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                   )
+
+        self.resm2 = nn.Sequential(nn.Conv2d(self.channels, self.channels,kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  )
+
+        self.resm3 = nn.Sequential(nn.Conv2d(self.channels, self.channels,kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  )
+
+        self.resm4 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  nn.ReLU(),
+                                  nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
+                                  nn.BatchNorm2d(self.channels),
+                                  )
+        
+        self.outc = nn.Conv2d(self.channels,self.channels*9, kernel_size=1, stride = 1,padding = 0)
         self.kernel_pred = KernelConv(kernel_size2, sep_conv, self.core_bias)
         self.conv_final = nn.Conv2d(self.channels*4,self.channels, kernel_size=3, stride=1, padding=1)
 
 
-
-
+              
     def forward(self, input,white_level=1.0):
         m1  = F.relu(input + self.resm1(input))
         m2  = F.relu(m1+ self.resm2(m1))
@@ -204,11 +326,11 @@ class Mnet(nn.Module):
         return m_rev
 
 # proxNet_B
-class Xnet(nn.Module):
-    def __init__(self, channels,color=True, burst_length=1, blind_est=True, kernel_size2=[5], sep_conv=False,
-                core_bias=False ):
-        super(Xnet, self).__init__()
+class Xnet1(nn.Module):
+    def __init__(self, channels,color=True, burst_length=1, blind_est=True, kernel_size2=[3], sep_conv=False,core_bias=False):
+        super(Xnet1, self).__init__()
         self.burst_length = burst_length
+              
         self.core_bias = core_bias
         self.channels = channels
         self.resx1 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
@@ -224,7 +346,7 @@ class Xnet(nn.Module):
                                   nn.BatchNorm2d(self.channels),
                                   )
         self.resx3 = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1, dilation = 1),
-                                  nn.BatchNorm2d(self.channels),
+                                 nn.BatchNorm2d(self.channels),
                                   nn.ReLU(),
                                   nn.Conv2d(self.channels, self.channels,  kernel_size=3, stride = 1, padding= 1, dilation = 1),
                                   nn.BatchNorm2d(self.channels),
@@ -233,17 +355,19 @@ class Xnet(nn.Module):
                                   nn.BatchNorm2d(self.channels),
                                   nn.ReLU(),
                                   nn.Conv2d(self.channels, self.channels, kernel_size=3, stride = 1, padding= 1,  dilation = 1),
-                                  nn.BatchNorm2d(self.channels),)
-        self.outc = nn.Conv2d(self.channels,self.channels, kernel_size=1, stride = 1,padding = 0)
+                                  nn.BatchNorm2d(self.channels),
+                                  )
+        self.outc = nn.Conv2d(self.channels,self.channels*9, kernel_size=1, stride = 1,padding = 0)
         self.kernel_pred = KernelConv(kernel_size2, sep_conv, self.core_bias)
-        self.conv_final = nn.Conv2d(self.channels*4,self.channels, kernel_size=3, stride=1, padding=1)   
+        self.conv_final = nn.Conv2d(self.channels*4,self.channels, kernel_size=3, stride=1, padding=1)
 
-                               
+          
     def forward(self, input,white_level=1.0):
         x1  = F.relu(input + self.resx1(input))
         x2  = F.relu(x1 + self.resx2(x1))
         x3  = F.relu(x2 + self.resx3(x2))
         x4  = F.relu(x3 + self.resx4(x3))
+        
         core = self.outc(x4)
         
         pred1 = self.kernel_pred(input, core, white_level, rate=1)
@@ -259,7 +383,7 @@ class Xnet(nn.Module):
         return pred
 
 
-
+        
 
 
 
@@ -269,7 +393,7 @@ class KernelConv(nn.Module):
     """
     the class of computing prediction
     """
-    def __init__(self, kernel_size2=[5], sep_conv=False, core_bias=False):
+    def __init__(self, kernel_size2=[3], sep_conv=False, core_bias=False):
         super(KernelConv, self).__init__()
         self.kernel_size2 = sorted(kernel_size2)
         self.sep_conv = sep_conv

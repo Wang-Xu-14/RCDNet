@@ -30,7 +30,7 @@ class Trainer():
             )
             for _ in range(len(ckp.log)): self.scheduler.step()
 
-        self.error_last = 1e8
+        self.error_last = 1e20
 
     def train(self):
         self.scheduler.step()
@@ -148,7 +148,7 @@ class Trainer():
             self.ckp.save(self, epoch, is_best=(best[1][0] + 1 == epoch))
 
     def prepare(self, *args):
-        device = torch.device('cpu' if self.args.cpu else 'cuda:0')
+        device = torch.device('cpu' if self.args.cpu else 'cuda:0,1')
         def _prepare(tensor):
             if self.args.precision == 'half': tensor = tensor.half()
             return tensor.to(device)
