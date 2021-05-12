@@ -18,7 +18,7 @@ def print_network(net):
 if __name__ == '__main__':
     torch.manual_seed(args.seed)
     checkpoint = utility.checkpoint(args)
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
     print(torch.cuda.current_device())
     if checkpoint.ok:
         loader = data.Data(args)
