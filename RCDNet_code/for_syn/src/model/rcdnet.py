@@ -306,9 +306,9 @@ class Mnet1(nn.Module):
               
     def forward(self, input,white_level=1.0):
         m1  = F.relu(input + self.resm1(input))
-       # m2  = F.relu(m1+ self.resm2(m1))
-       # m3  = F.relu(m2+ self.resm3(m2))
-       # m4  = F.relu(m3+ self.resm4(m3))
+        m2  = F.relu(m1+ self.resm2(m1))
+        m3  = F.relu(m2+ self.resm3(m2))
+        m4  = F.relu(m3+ self.resm4(m3))
         m5 =self.f(m1-self.tau)                                     # for sparse rain map
         
         core = self.outc(m5)
@@ -364,11 +364,11 @@ class Xnet1(nn.Module):
           
     def forward(self, input,white_level=1.0):
         x1  = F.relu(input + self.resx1(input))
-       # x2  = F.relu(x1 + self.resx2(x1))
-       # x3  = F.relu(x2 + self.resx3(x2))
-       # x4  = F.relu(x3 + self.resx4(x3))
+        x2  = F.relu(x1 + self.resx2(x1))
+        x3  = F.relu(x2 + self.resx3(x2))
+        x4  = F.relu(x3 + self.resx4(x3))
         
-        core = self.outc(x1)
+        core = self.outc(x4)
         
         pred1 = self.kernel_pred(input, core, white_level, rate=1)
         pred2 = self.kernel_pred(input, core, white_level, rate=2)
