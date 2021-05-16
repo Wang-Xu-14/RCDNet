@@ -130,6 +130,7 @@ def quantize(img, rgb_range):
     return img.mul(pixel_range).clamp(0, 255).round().div(pixel_range)
 
 def calc_psnr(sr, hr, scale, rgb_range, benchmark=False):
+    hr = hr[:,:,:-1,:-1]
     diff = (sr - hr).data.div(rgb_range)
     if benchmark:
         shave = scale
